@@ -8,5 +8,9 @@ lightgbm>=4.0.0
 catboost>=1.2.0
 rapidfuzz>=3.10.0
 anyascii>=0.3.3
+torch>=2.0.0
+sentence-transformers>=3.0.0
+faiss-cpu>=1.8.0
+psutil>=5.9.0
 
 
