@@ -1,7 +1,8 @@
 # Amazon ML Challenge 2026: Business Entity Resolution
 ## Comprehensive Dataset, System Architecture & Pipeline Flow Guide
 
-**Team:** DataResolvers  
+**Team:** Shield  
+**Team Members:** Jagadish Pavan Chegondi, BODDU SURYA TEJA, Leela Sai Vardhan Dhavala  
 **Task:** Business Entity Resolution  
 **Target Metric:** Macro-averaged Per-Entity $F_{0.5}$ (Precision weighted 2× over recall; singletons scored 1.0 / 0.0)  
 **Achieved Validation Score:** **0.98006 (98.01%)** | **5-Fold CV Mean:** **0.97342 $\pm$ 0.00409**

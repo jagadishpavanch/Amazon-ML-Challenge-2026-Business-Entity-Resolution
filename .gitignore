@@ -1,22 +1,23 @@
-# Dataset files (large files > 1 GB)
-student_resource/dataset/
+# competition data and organiser files (not redistributable)
 dataset/
-*.tsv.gz
-*.tar.gz
+utils/
+
+# models, caches and outputs
+models/
+cache*/
+cache_repro/
+output*/
+reports/
+logs/
+*.npy
+*.npz
+*.parquet
+*.pkl
+*.safetensors
 *.zip
 
-# OS and Cache files
-.DS_Store
-__MACOSX/
+# python
 __pycache__/
-*.py[cod]
-*$py.class
-.ipynb_checkpoints/
-*.log
-catboost_info/
-
-
-# Git LFS or large outputs (>100MB)
-output/candidate_pairs.tsv
-student_resource/output/candidate_pairs.tsv
-output/checkpoints/
+*.pyc
+.venv/
+er_venv/

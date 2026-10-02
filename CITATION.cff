@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite it as below."
+title: "Multi-Source Business Entity Resolution (Team Shield, ML Challenge 2026)"
+authors:
+  - given-names: Jagadish Pavan
+    family-names: Chegondi
+  - given-names: BODDU SURYA
+    family-names: TEJA
+  - given-names: Leela Sai Vardhan
+    family-names: Dhavala
+date-released: 2026-09-27
+license: MIT
+repository-code: "https://github.com/jagadishpavanch/Amazon-ML-Challenge-2026-Business-Entity-Resolution"

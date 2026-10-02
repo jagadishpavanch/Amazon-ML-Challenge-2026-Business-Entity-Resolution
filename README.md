@@ -1,333 +1,513 @@
-# Business Entity Resolution Pipeline — Amazon ML Challenge 2026
+# Multi-Source Business Entity Resolution
 
-An end-to-end, reproducible, 100% offline Machine Learning system designed for the **Amazon ML Challenge 2026: Business Entity Resolution**. 
+Match business records across three noisy sources, find every duplicate of each reference business,
+and generalise to a country that never appears in training.
 
-The pipeline matches deduplicated reference business records (**Source 1**) against noisy, multi-source commercial entity fragments (**Source 2** and **Source 3**) using business names, addresses, and country attributes. It is strictly optimized for the competition's primary metric: **Macro-averaged per-entity $F_{0.5}$** (precision weighted 2× over recall, with singletons explicitly scored 1.0 or 0.0), alongside Amazon's candidate-generation efficiency criteria (**smaller candidate sets per entity rank higher**).
+This is the solution of **Team Shield** (Jagadish Pavan Chegondi, BODDU SURYA TEJA, Leela Sai Vardhan Dhavala) to the **Business Entity Resolution** task of ML Challenge 2026.
+It scores a **public-leaderboard macro F0.5 of 0.8710** (87.10%).
 
----
-
-## Table of Contents
-1. [Competition Constraints & Compliance](#1-competition-constraints--compliance)
-2. [Evaluation Metric & Mathematical Formulation](#2-evaluation-metric--mathematical-formulation)
-3. [Architecture Overview: V1 Baseline vs SOTA Hybrid V2](#3-architecture-overview-v1-baseline-vs-sota-hybrid-v2)
-4. [Diagnostic Analysis: Where Pure Token Systems Fail](#4-diagnostic-analysis-where-pure-token-systems-fail)
-5. [The SOTA Hybrid Solution (Approach 1 + Approach 3)](#5-the-sota-hybrid-solution-approach-1--approach-3)
-6. [Head-to-Head Benchmark: V1 vs V2 Across Stratified Edge Cases](#6-head-to-head-benchmark-v1-vs-v2-across-stratified-edge-cases)
-7. [Full Test Set Inference Results & Leaderboard Validation](#7-full-test-set-inference-results--leaderboard-validation)
-8. [Directory & Package Structure](#8-directory--package-structure)
-9. [Step-by-Step Reproduction Guide](#9-step-by-step-reproduction-guide)
-10. [Submission Package Specification](#10-submission-package-specification)
-
----
-
-## 1. Competition Constraints & Compliance
-
-- **Parameter Budget Limit ($\le 8\text{ Billion}$)**:
-  - *Baseline*: Tri-Model Gradient Boosted Ensemble ($\sim 10,000$ tree decision nodes, $< 0.000015\text{B}$ parameters).
-  - *SOTA Hybrid*: Sentence Transformer (`all-MiniLM-L6-v2`, 22.7M parameters) + Tree Ensemble $\implies \mathbf{\sim 22.7\text{M parameters}} \ll 8\text{B}$ limit ($< 0.3\%$ of allowance).
-- **Model Licensing**: All components use permissive **Apache-2.0** (XGBoost, CatBoost, Sentence-Transformers) or **MIT** (LightGBM, RapidFuzz, Polars, Scikit-Learn) licenses.
-- **100% Offline / Zero External Data**: Strictly prohibited from using external geocoding, Google Maps, web APIs, or company registry lookups. All inference runs offline on local hardware.
-- **Open-String Country Generalization**:
-  - Training dataset covers `US` (59.98%) and `India` (40.02%).
-  - Test dataset introduces `France` (14.98%, 259,452 entities unseen in training).
-  - The pipeline uses zero hardcoded categorical branching, processing all country alphabets and address formats uniformly.
-- **Candidate Footprint Criterion**: Amazon specifically evaluates `candidate_pairs.tsv` to reward solutions that cut the candidate search space to a smaller, higher-precision set per $S_1$ entity.
-- **Strict File Format**: Tab-separated values (`.tsv`, `sep="\t"`), no quotation artifacts, one row per $S_1$ entity in identical order as `test_source1.tsv`.
+- [Introduction](#introduction)
+- [Problem statement in detail](#problem-statement-in-detail)
+- [Our work](#our-work)
+- [Results](#results)
+- [How it works](#how-it-works)
+- [Repository layout](#repository-layout)
+- [Installation](#installation)
+- [Data](#data)
+- [Usage](#usage)
+- [Command-line reference](#command-line-reference)
+- [Configuration](#configuration)
+- [Hardware and runtime](#hardware-and-runtime)
+- [Models and licences](#models-and-licences)
+- [Team](#team)
+- [License](#license)
 
 ---
 
-## 2. Evaluation Metric & Mathematical Formulation
+## Introduction
 
-Submissions are evaluated on **Macro-averaged $F_{\beta}$ with $\beta = 0.5$**:
+**The task.** Each input source is a TSV of business records: `entity_id`, `business_name`,
+`business_address` and `country`.
 
-$$F_{0.5} = \frac{(1 + 0.5^2) \times \text{Precision} \times \text{Recall}}{0.5^2 \times \text{Precision} + \text{Recall}} = \frac{1.25 \times \text{Precision} \times \text{Recall}}{0.25 \times \text{Precision} + \text{Recall}}$$
+- **Source 1 (S1)** is deduplicated: one row per business.
+- **Sources 2 and 3 (S2, S3)** contain noisy copies of those businesses plus synthetic distractors.
 
-### Evaluation Rules:
-1. **Precision-Weighted**: $F_{0.5}$ weights precision 2× heavier than recall. In entity resolution, falsely merging two different real-world businesses is twice as damaging as missing a link.
-2. **Singletons (0 True Matches)**: Singletons constitute **5.58%** of the ground truth (123,247 / 2,206,821 reference entities).
-   - If an entity has zero true matches and the model predicts an **empty string**, score = **$1.0$**.
-   - If any false candidate is predicted, score drops immediately to **$0.0$**.
-3. **Macro-Averaging**: $F_{0.5}$ is computed per $S_1$ entity, then averaged uniformly across all $1,732,544$ test entities.
+For every S1 entity, the system returns all S2/S3 records of the same real-world business: zero,
+one or many.
+
+**What makes it hard:**
+
+- **Noise:**
+  - abbreviations and legal suffixes (`Pvt Ltd` ↔ `Private Limited`, `SARL`, `LLC`);
+  - typos and garbled names;
+  - reordered or truncated addresses;
+  - landmarks ("Near SBI ATM");
+  - native-script names (Devanagari, Malayalam, Kannada, Bengali).
+- **Distractors:** about 26% of pool records are look-alikes built from S1 names.
+- **An unseen country:** training covers the US and India; the test set adds France.
+- **The metric:** macro F0.5 per S1 entity weighs precision twice as much as recall. A single false
+  match on a business that has no duplicates scores 0 for that entity.
+
+**Constraints followed:**
+
+- no external data, APIs or geocoding;
+- only MIT / Apache-2.0 pretrained models, each ≤ 8B parameters;
+- no country-specific logic: the country is used only to require that matched records share it.
 
 ---
 
-## 3. Architecture Overview: V1 Baseline vs SOTA Hybrid V2
+## Problem statement in detail
+
+### Input
+
+| File | Rows (train / test) | Columns |
+|---|---|---|
+| `*_source1.tsv` (S1, the deduplicated reference) | 2.21M / 1.73M | `entity_id`, `business_name`, `business_address`, `country` |
+| `*_source2.tsv`, `*_source3.tsv` (S2, S3: the pool) | 10.3M S2+S3 in train | same columns |
+| `train_ground_truth.tsv` | 2.21M | `source1_entity_id`, `matched_entity_ids` (comma-separated, empty if none) |
+
+Countries: **US and India in train**. The test adds **France (259k S1 entities) that never appears in
+training**. Test S1 has India 810k, US 663k and France 259k.
+
+### Output
+
+Two TSVs, each with one row for **every** test S1 entity:
+
+- **`matching_results.tsv`:** the S2/S3 IDs predicted to be the same business.
+- **`candidate_pairs.tsv`:** the exact candidate set the model scored. Every predicted match must be
+  one of its candidates.
+
+### Metric: macro F0.5 per S1 entity
 
 ```
-                       ┌─────────────────────────────────────────────────┐
-                       │               Raw Business Records              │
-                       │           (Source 1, Source 2, Source 3)        │
-                       └────────────────────────┬────────────────────────┘
-                                                │
-                                                ▼
-                       ┌─────────────────────────────────────────────────┐
-                       │         Stage 2: Deterministic Normalization    │
-                       │   - Unicode NFKD & diacritic stripping          │
-                       │   - Cross-script AnyAscii transliteration       │
-                       │   - Multilingual legal suffix canonicalization  │
-                       │   - Postal code, house number, & landmark regex │
-                       └────────────────────────┬────────────────────────┘
-                                                │
-                 ┌──────────────────────────────┴──────────────────────────────┐
-                 ▼                                                             ▼
-  ┌──────────────────────────────┐                              ┌──────────────────────────────┐
-  │   BASELINE (V1) BLOCKING     │                              │    SOTA HYBRID (V2) BLOCKING │
-  │   - Strategy 1: Rare tokens  │                              │   - Token Inverted Index     │
-  │   - Strategy 2: Street + Pfx │                              │   - FAISS IVF-Flat ANN Dense │
-  │   - Strategy 3: Locality pair│                              │     Vectors (all-MiniLM-L6)  │
-  │   - Strategy 4: Name+Addr pfx│                              │   - Char 3-Gram TF-IDF Sparse│
-  │   - Fixed k = 8 candidates   │                              │   - Adaptive Confidence k<=8 │
-  └──────────────┬───────────────┘                              └──────────────┬───────────────┘
-                 │                                                             │
-                 └──────────────────────────────┬──────────────────────────────┘
-                                                │
-                                                ▼
-                       ┌─────────────────────────────────────────────────┐
-                       │      Stage 4: 55-D Pairwise Alignment Signals   │
-                       │  - RapidFuzz (Token Sort, Set, Partial, JW)     │
-                       │  - Character 2-gram & 3-gram Jaccard distances  │
-                       │  - PIN code hierarchy (exact, prefix-3, state)  │
-                       │  - Street number logarithmic difference         │
-                       │  - Harmonic mean & product interaction terms    │
-                       └────────────────────────┬────────────────────────┘
-                                                │
-                                                ▼
-                       ┌─────────────────────────────────────────────────┐
-                       │   Stage 5: Tri-Model Blended Gradient Ensemble  │
-                       │  - XGBoost (0.40) + LightGBM (0.35) + CatBoost  │
-                       │  - 5-Fold GroupKFold (zero reference leakage)   │
-                       │  - Class-imbalance calibrated probability sweep │
-                       └────────────────────────┬────────────────────────┘
-                                                │
-                                                ▼
-                       ┌─────────────────────────────────────────────────┐
-                       │     Stage 7: Global Consistency Post-Processing │
-                       │  - Enforces physical 1-to-at-most-1 constraint  │
-                       │  - Greedy conflict resolver via max-probability │
-                       │  - Empty list assignment for singletons         │
-                       └────────────────────────┬────────────────────────┘
-                                                │
-                                                ▼
-                       ┌─────────────────────────────────────────────────┐
-                       │             Final Validated Outputs             │
-                       │  - matching_results.tsv (1.73M rows)            │
-                       │  - candidate_pairs.tsv  (1.73M rows)            │
-                       └─────────────────────────────────────────────────┘
+truth empty and prediction empty          -> 1.0
+exactly one of truth / prediction empty   -> 0.0
+otherwise  P = tp/|pred|, R = tp/|truth|, F0.5 = 1.25·P·R / (0.25·P + R)
+score = mean over all S1 entities
+```
+
+Precision counts twice as much as recall. For an entity with four true matches:
+- returning three correct matches scores 0.94;
+- returning all four plus one wrong record scores only 0.83;
+- a single wrong match on a business with no duplicates scores 0.
+
+### What the data looks like (from our EDA on train)
+
+| Finding | Value | Consequence for the design |
+|---|---|---|
+| Entities with no duplicates | 5.6% | empty predictions must be possible and precise |
+| True matches per entity | 3.46 on average (≈1.7 in S2, ≈1.8 in S3) | retrieve from S2 and S3 separately; the matches form a cluster |
+| Pool records owned by any entity | 74%; **26% are distractors** built from S1 names | the main source of false merges |
+| Pool records matching more than one entity | **none** | a one-owner rule: each record belongs to at most one entity |
+| Matched pairs with the same country | 100% | country used only as an equality filter |
+
+**Name noise:**
+- legal-suffix swaps (Pvt Ltd / Private Limited / LLC);
+- typos and word reordering;
+- website and hashtag forms;
+- garbled names;
+- names in Devanagari, Malayalam, Kannada or Bengali script.
+
+**Address noise:**
+- reordering and abbreviations (St, Rd, French `R.`, `N°`);
+- truncation and missing postcodes;
+- landmarks ("Near SBI ATM").
+
+**France only (test):** the same business name at a neighbouring house number.
+
+### Rules
+
+- No external data, APIs or geocoding. Only pretrained weights may be downloaded.
+- Pretrained models must be MIT or Apache-2.0 licensed and at most 8B parameters.
+- No rule, filter or feature may depend on the specific country names.
+- Models and thresholds must be chosen by cross-validation, and seeds fixed.
+- The submission must be reproducible from the submitted code.
+
+---
+
+## Our work
+
+We built the system in 15 measured versions over three days. We kept a change only if
+cross-validation improved, and checked every leaderboard score against it. The full log, with
+every version, number and failed idea, is in `docs/VERSION_LOG.md`.
+
+### Day 1: a strong, valid baseline (v1–v4, leaderboard 0.957 → 0.958)
+
+- **Normalisation** that never branches on country:
+  - transliteration;
+  - legal-suffix classes for US, Indian and French forms;
+  - a consonant skeleton, so that "praaivett limittedd" ≈ "private limited";
+  - address parsing.
+- **Multi-pass blocking** (word / character TF-IDF, multilingual embeddings, exact keys) per country
+  and per source. Recall was 0.970 at 35 candidates per entity.
+- **Stage-1 LightGBM** on about 100 pair features. The biggest single feature gain (+0.010) came
+  from **IDF-weighted name overlap**: sharing a rare word ("Roopaya") matters, sharing a common one
+  ("Sai", "Shree") does not.
+- **Stage-2 stacking.** A second LightGBM learns the one-owner rule from each pair's neighbours: the
+  entity's other candidates and the best rival owner of the record.
+- **An address-only pass** for pool records whose names are in a non-Latin script.
+
+### Day 2: treating matching as a cluster problem, and adding cross-encoders (v5–v9, → 0.978)
+
+- **Sibling expansion.** An entity's true matches are near-duplicates of each other, so its
+  confident candidates are reused as queries to find more of them. With siblings chosen by the
+  round-1 model, recall rose to 0.981.
+- **Pool twins.** Real records almost always have a near-duplicate in the other source; synthetic
+  distractors rarely do. This signal alone separates distractors with AUC 0.79.
+- **Fine-tuned cross-encoders** (MiniLM-L12, then XLM-R base) read both records together, in any
+  script. This was the largest single gain (+0.009 CV).
+  - They are trained on entities kept out of the stage-2 sample, so stacking their scores does not
+    leak labels.
+- **Rejected** (evidence in the log):
+  - wider retrieval;
+  - self-training on test pseudo-labels;
+  - French pseudo-label fine-tuning (lowered the leaderboard);
+  - per-entity sample weighting.
+
+### Day 3: recall, then transfer to the unseen country (v10–v15, → 0.9848)
+
+- **Measuring the ceiling.** The best score any model could reach on our candidates was 0.9926, so
+  missed candidates cost as much as model errors.
+- **A fine-tuned retrieval bi-encoder.** MiniLM, trained on training matches, became a new blocking
+  pass. Recall rose from **0.9813 to 0.9952** and that ceiling from 0.9928 to 0.9986.
+- **The surprise.** Cross-validation rose to 0.988, but the leaderboard *fell* (v10m).
+  - **Diagnosis:** France was over-matching. Fewer French entities got empty predictions than the
+    training no-duplicate rate, and many extra French matches came only from the new pass.
+- **The fix: validating for an unseen country.** We trained stage-2 on one training country and
+  scored the other.
+  - **What didn't transfer:** the bi-encoder's own score and the candidate-density features. Both
+    were dropped.
+  - **Threshold:** a stricter 0.8 transferred better than the in-country optimum.
+  - **Added:** XLM-R large as a fourth cross-encoder.
+  - **Result:** leaderboard **0.9778 → 0.9847**, the largest jump of the competition.
+- **Final tuning,** again judged by the leave-country-out check:
+  - stage-2 regularisation (`min_child_samples=500`);
+  - an average of three stage-2 variants;
+  - thresholds 0.75 and 0.85 both scored lower than 0.8 on the leaderboard.
+- **Engineering.** We scaled the pipeline to three machines. That meant fixing worker-pool fork
+  storms on a 192-core server, moving cross-encoder training into child processes to avoid running
+  out of memory, and splitting scoring across GPUs.
+
+---
+
+## Results
+
+Macro F0.5; CV is out-of-fold on the same 600k training entities for every version.
+
+| Version | Main idea | CV | Public LB |
+|---|---|---|---|
+| v3 | multi-pass blocking + LightGBM + stage-2 stacking | 0.9727 | 0.957 |
+| v5 | sibling expansion, sibling features, MiniLM cross-encoder | 0.9820 | 0.973 |
+| v7 | + XLM-R base cross-encoder | 0.9851 | 0.9768 |
+| v9 | + hard-example cross-encoder epoch, 3-seed stage-2 | 0.9856 | 0.9778 |
+| v10m | + fine-tuned bi-encoder retrieval pass (recall 0.9813 → 0.9952) | 0.9881 | 0.9769 |
+| v13 | + XLM-R large; stage-2 features and threshold chosen by a leave-country-out check | 0.9905 | 0.9847 |
+| v15 | + stage-2 regularisation (`min_child_samples=500`) | 0.9907 | 0.98483 |
+| **final** | **average of the v12, v13 and v15 stage-2 models** | – | **0.8710 (87.10%)** |
+
+**Lessons:**
+
+1. **Retrieval recall is the ceiling.** A bi-encoder fine-tuned on training matches lifted
+   candidate recall from 98.1% to 99.5%.
+2. **An unseen country needs its own validation.** v10m improved CV but lost on the leaderboard,
+   because it over-matched French records.
+   - **The check:** train stage-2 on one training country and score the other (leave-country-out).
+   - **What it showed:** features that transfer badly (the bi-encoder score, candidate-density
+     counts) should be dropped, and a stricter 0.8 threshold transfers better.
+   - **The result:** those changes gave the largest leaderboard jump (+0.007).
+3. **Cross-encoders that read raw multilingual text** were the strongest single signal:
+   `बाबा पावर प्राइवेट लिमिटेड` ↔ "Baba Power Private Limited" scores +9.0.
+
+---
+
+## How it works
+
+```
+raw TSVs ─► normalise ─► blocking (7 passes + sibling expansion) ─► stage-1 LightGBM (103 features)
+                                                                          │
+                     4 fine-tuned cross-encoders read each candidate pair │
+                                                                          ▼
+                     stage-2 LightGBM (neighbour / rival / sibling / cross-encoder features)
+                                                                          │
+                                   one-owner rule + threshold 0.8 ─► matching_results.tsv
+```
+
+1. **Normalisation** (`normalize.py`):
+   - transliteration;
+   - legal-suffix classes (US, Indian and French forms);
+   - abbreviation expansion;
+   - DBA variants;
+   - a consonant skeleton for garbled names;
+   - address parsing (house numbers, postcode, landmarks, city).
+2. **Blocking** (`blocking.py`): candidates come only from the same country, retrieved separately
+   from S2 and S3. Top-K per source:
+
+   | Pass | Representation | K |
+   |---|---|---|
+   | `w` | word TF-IDF | 10 |
+   | `e1` | MiniLM sentence embedding | 3 |
+   | `c` | character 3-gram TF-IDF | 3 |
+   | `a` | address TF-IDF against non-Latin-script names | 5 |
+   | `x1`, `x2` | exact keys | – |
+   | `f` | fine-tuned bi-encoder | 5 |
+   | `s` | sibling expansion | 3 |
+
+   - **Sibling expansion:** confident candidates are reused as queries to find their near-duplicates.
+   - **Result:** recall 0.9952 at 43 candidates per entity.
+3. **Stage-1** (`features.py`, `model.py`): LightGBM on 103 pair features. They cover string
+   similarity, IDF-weighted name overlap, address agreement and context ranks, plus *pool twins*:
+   whether a record has a near-duplicate, which synthetic distractors usually lack. Trained with
+   5-fold GroupKFold out-of-fold predictions and isotonic calibration.
+4. **Cross-encoders** (`cross_encoder.py`): four models read `name | address` pairs:
+   - MiniLM-L12;
+   - XLM-R base;
+   - XLM-R base with a hard-example epoch;
+   - XLM-R large.
+
+   They are trained on training entities disjoint from the stage-2 sample, so stacking them does
+   not leak labels.
+5. **Stage-2** (`stage2.py`, `stage2_refit.py`): LightGBM re-scores each pair from its neighbours:
+   - the entity's other candidates;
+   - the strongest rival owner of the record (each record belongs to at most one entity);
+   - confident siblings;
+   - the cross-encoder scores.
+6. **Decision** (`decide.py`): the one-owner rule plus a global threshold of 0.8. The final
+   submission averages three stage-2 variants (`blend_refits.py`).
+
+---
+
+## Repository layout
+
+```
+.
+├── README.md
+├── LICENSE
+├── requirements.txt
+├── code/business_entity_resolution/
+│   ├── README.md                 # reproduction guide
+│   ├── reproduce.sh              # end-to-end reproduction of the final submission
+│   └── src/
+│       ├── run_pipeline.py       # one full round: normalise → block → features → models → outputs
+│       ├── config.py             # paths, seeds, K per pass, LightGBM parameters, env overrides
+│       ├── io_utils.py  metrics.py  normalize.py  prep.py  embed.py
+│       ├── blocking.py  features.py  siblings.py  stage2.py  model.py  decide.py  cv.py
+│       ├── cross_encoder.py  train_cross_encoder.py  ce_adapt.py  ce_score_pairs.py
+│       ├── train_biencoder.py    # retrieval bi-encoder for pass f
+│       ├── stage2_refit.py       # stage-2 refit on cached tables (+ extra cross-encoder features)
+│       ├── blend_refits.py       # average several stage-2 refits → final output
+│       ├── rethreshold.py        # re-apply a saved refit with another threshold
+│       └── eda.py  analyze.py  tune_blocking.py  experiment.py   # diagnostics
+├── experiments/                  # leave-country-out and bi-encoder studies (not needed to reproduce;
+│                                 #   copy into code/business_entity_resolution/src/ to run)
+└── docs/
+    ├── SOLUTION.md               # full methodology write-up (the challenge's Documentation_template.md)
+    ├── TeamShield_Methodology.pdf # methodology summary (PDF)
+    └── VERSION_LOG.md            # every version, its change, CV and leaderboard score
 ```
 
 ---
 
-## 4. Diagnostic Analysis: Where Pure Token Systems Fail
+## Installation
 
-Diagnostic auditing on a 3,000-entity slice revealed the exact performance bottleneck:
-- **Global Precision**: **99.6%** (The classifier almost never makes false merge mistakes).
-- **Global Recall**: **91.1%** (**8.9% of true matches are lost**).
-- **Error Attribution**:
-  - **90% of all errors (828 pairs)** were **blocking misses** (the true match was never retrieved into the candidate set).
-  - Only **10% of errors (87 pairs)** were classifier decision errors.
+Requires Python 3.10 on Linux and a CUDA GPU. The GPU is needed for embeddings, exact k-NN and
+cross-encoder training. CPU-only runs work but are very slow.
 
-### The 5 Failure Archetypes Identified:
-1. **Missing Address Dead Zone**: $S_1$ has a complete address, but $S_2/S_3$ has an empty string `""`. All address-based token strategies produce zero matches.
-2. **DBA / Trade Names / Domain Names**: Businesses operate under acronyms or URLs (e.g., `Huntley and Stidham Sunrise LLC` vs `shstidham.com`; `New Life Zion` vs `znlife.com`). Token overlap is $0\%$.
-3. **Address Variation & Unit Suffixes**: Street abbreviations (`Road` vs `RD`), county vs city naming, and appended apartment letters (`2815` vs `2815D`) fragment token indices.
-4. **Typographical & OCR Scrambling**: Transposed characters or OCR noise (e.g. `The Mi0n Trust LLC` with digit `0` vs `Mion Trust LLC`).
-5. **Singletons**: Entities with no counterpart in $S_2/S_3$, where over-generating candidate pairs risks false positives.
-
----
-
-## 5. The SOTA Hybrid Solution (Approach 1 + Approach 3)
-
-To solve the 90% blocking bottleneck while satisfying Amazon's efficiency criteria, we implemented a unified **SOTA Hybrid Blocking Engine** in [`blocking_v2.py`](file:///c:/Users/jagad/Downloads/Amazon-ML-Business-Entity-Resolution_solution/code/business_entity_resolution/src/blocking_v2.py):
-
-### Component 1: Dense Semantic Vector Blocking (Approach 1)
-- Uses `sentence-transformers/all-MiniLM-L6-v2` (22.7M parameters, Apache-2.0).
-- Encodes entities into normalized 384-dimensional dense vectors: `"{name} | {address} | {postal_code}"`.
-- Builds a **FAISS IVF-Flat ANN Index** per country for sub-millisecond retrieval.
-- Bridges the semantic gap: captures DBA names, abbreviations, and domain aliases without requiring token overlap.
-
-### Component 2: Sparse Character 3-Gram TF-IDF Retrieval (Approach 3)
-- Uses sublinear TF-IDF vectorization over character 3-grams (`analyzer='char_wb'`, `ngram_range=(3, 4)`).
-- Natural inverse-document-frequency boosts distinctive brand terms while suppressing high-frequency entity stopwords.
-- Captures OCR errors, minor typos, and scrambled names (`Mcfee` $\sim$ `Mcfee-Rpuhebtcltc`).
-- Blazingly fast: builds in **$< 0.5$ seconds** per country.
-
-### Component 3: Adaptive $k$ Candidate Fusion
-- Combines candidate votes: $\text{Score} = 3.0 \times \text{Token} + 2.0 \times \text{VectorSim} + 1.5 \times \text{TFIDFSim}$.
-- Rather than a fixed $k=8$ for every entity, high-confidence matches prune the candidate list to $2-3$ items, while singletons receive zero low-confidence distractors.
-
----
-
-## 6. Head-to-Head Benchmark: V1 vs V2 Across Stratified Edge Cases
-
-We benchmarked Baseline V1 vs SOTA Hybrid V2 on a leakage-free validation slice of **996 reference entities against an 18,420-record distractor pool**, explicitly classified into all 5 noise categories.
-
-### 1. Overall Metric Comparison
-
-| Metric | Baseline V1 (Token Inverted Index) | SOTA Hybrid V2 (Token + Vector + TF-IDF) | Delta (Lift) | Interpretation |
-| :--- | :---: | :---: | :---: | :--- |
-| **Macro $F_{0.5}$ (Official Metric)** | **97.618%** | **98.225%** | **+0.606%** | **Statistically Significant SOTA Gain** |
-| **Macro $F_{1.0}$** | **95.878%** | **96.859%** | **+0.982%** | **Major Balanced Metric Improvement** |
-| **Global Precision** | **99.657%** | **99.537%** | -0.120% | Maintained Near-Perfect Precision |
-| **Global Recall** | **93.287%** | **94.191%** | **+0.905%** | Successfully Recovered Missing Links |
-| **Blocking Recall Ceiling** | **94.133%** | **94.980%** | **+0.846%** | Captured 29 True Pairs Missed by V1 |
-| **Average Candidates / Entity** | **7.52** | **7.38** | **-0.14** | **Smaller Search Footprint (Amazon Rule)** |
-
-### 2. Stratified Performance Across Noise Categories (Macro $F_{0.5}$)
-
-| Edge Case Category | Entity Count | Baseline V1 ($F_{0.5}$) | SOTA Hybrid V2 ($F_{0.5}$) | Lift | Status |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **0. Standard Clean Match** | 242 (24.3%) | 99.04% | **99.31%** | **+0.28%** | Solidified |
-| **1. Singleton (0 Matches)** | 55 (5.5%) | 98.18% | **98.18%** | $\pm 0.00\%$ | **Zero False Merges** |
-| **2. Missing / Empty Address** | 143 (14.4%) | 97.56% | **97.79%** | **+0.23%** | Recovered via dense vector |
-| **3. DBA / Trade Name / Domain**| 171 (17.2%) | 94.47% | **94.64%** | **+0.18%** | Recovered via semantic similarity |
-| **4. Address Format Variation** | 172 (17.3%) | 97.84% | **99.30%** | **+1.47%** | **Major Breakthrough** |
-| **5. Typo & Scrambled Name** | 213 (21.4%) | 98.26% | **99.29%** | **+1.04%** | **Major Breakthrough** |
-
-### 3. Concrete Ground-Truth Recovery Examples
-- **Address Variation**: `Beacon Mortgage Digital Inc` at `1109 2nd Terrace, Barling, AR`.
-  - Target: `BARLING CITY, AR, 1109 2RD TER` and `1109 Second Ter, Arkansas, <NULL>, Barling`.
-  - Baseline V1 missed 2 true matches ($F_{0.5} = 0.882$).
-  - SOTA Hybrid V2 recovered all 5 true matches $\implies \mathbf{F_{0.5} = 1.000}$ (**+0.118 lift**).
-- **Leetspeak / Typographical Obfuscation**: `Mion Trust LLC` at `11512 Marcello Way, Rancho Cucamonga, CA`.
-  - Target: `The Mi0n Trust LLC` (digit `0` replacing letter `o`).
-  - Baseline V1 missed it ($F_{0.5} = 0.909$).
-  - SOTA Hybrid V2 recovered it via character 3-gram TF-IDF $\implies \mathbf{F_{0.5} = 1.000}$ (**+0.091 lift**).
-- **Severe Typo & Number Modification**: `Select Granite L.L.C.` at `1360 Dry Creek Road, Pinson, TN`.
-  - Target: `Select Grdaarte L.L.C.` at `1360a Dry Creek Road, Pinson, Tennessee`.
-  - Baseline V1 missed it ($F_{0.5} = 0.909$).
-  - SOTA Hybrid V2 recovered it $\implies \mathbf{F_{0.5} = 1.000}$ (**+0.091 lift**).
-
----
-
-## 7. Full Test Set Inference Results & Leaderboard Validation
-
-The test set inference was executed across all **1,732,544 Source 1 entities** and **9,970,000+ candidate target records** using country-by-country memory isolation:
-
-### Test Set Metrics by Country
-
-| Country | S1 Entities | Singletons (0 Matches) | Matched S1 Entities | Exact Match Bypasses | ML Pairs Scored | Candidate Pairs | Avg Candidates / Entity |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **France** | 259,452 | 47,167 (**18.18%**) | 212,285 (81.82%) | 28,796 | 2,020,238 | 2,049,034 | **7.90** |
-| **US** | 663,106 | 13,135 (**1.98%**) | 649,971 (98.02%) | 44,639 | 5,230,120 | 5,274,759 | **7.95** |
-| **India** | 809,986 | 35,207 (**4.35%**) | 774,779 (95.65%) | 25,529 | 6,362,687 | 6,388,216 | **7.89** |
-| **TOTAL** | **1,732,544** | **95,509 (5.51%)** | **1,637,035 (94.49%)** | **98,964** | **13,613,045** | **13,712,009** | **7.91** |
-
-### Official Validator Verification Output
-
-Executed [`student_resource/utils/validate_submission.py`](file:///c:/Users/jagad/Downloads/Amazon-ML-Business-Entity-Resolution_solution/student_resource/utils/validate_submission.py):
-
-```text
-ML Challenge 2026 — submission validator
-  test dir: dataset/test
-  required S1 entities: 1732544
-  matching_results.tsv: 1732544 rows (95509 empty, 1637035 non-empty).
-  candidate_pairs.tsv : 1732544 rows (2095 empty, 1730449 non-empty).
-
-PASS — no blocking issues found. Safe to submit.
-```
-
----
-
-## 8. Directory & Package Structure
-
-```text
-Amazon-ML-Business-Entity-Resolution_solution/
-├── output/
-│   ├── matching_results.tsv             # Final matches (1,732,544 rows — portal upload)
-│   ├── candidate_pairs.tsv              # Blocking candidate set (1,732,544 rows)
-│   └── checkpoints/                     # Per-country checkpoint recovery cache
-│       ├── candidates_France.tsv
-│       ├── candidates_US.tsv
-│       ├── candidates_India.tsv
-│       ├── matches_France.tsv
-│       ├── matches_US.tsv
-│       └── matches_India.tsv
-├── code/
-│   └── business_entity_resolution/
-│       ├── src/
-│       │   ├── __init__.py              # Package init
-│       │   ├── config.py                # Hyperparameters, regexes, paths
-│       │   ├── data.py                  # TSV streaming, leakage-free official split
-│       │   ├── normalize.py             # Unicode NFKD, legal suffixes, address tokens
-│       │   ├── blocking.py              # Baseline multi-strategy inverted index blocking
-│       │   ├── blocking_v2.py           # SOTA Hybrid (Token + FAISS ANN + TF-IDF 3-gram)
-│       │   ├── features.py              # 55-D pairwise alignment feature engineering
-│       │   ├── model.py                 # Tri-Model Ensemble (XGB+LGBM+CatBoost) & GroupKFold
-│       │   ├── consistency.py           # Stage 7 1-to-many global consistency conflict resolver
-│       │   ├── evaluate.py              # Official Macro F0.5 evaluation & threshold sweeper
-│       │   ├── tracker.py               # Automated experiment logger (CSV + JSON)
-│       │   ├── pipeline.py              # Master CLI pipeline
-│       │   ├── run_test_inference_fast.py # Full 1.73M test set fast inference engine
-│       │   ├── run_v2_inference.py      # V2 inference with hybrid blocking
-│       │   ├── validate_v2.py           # Validation benchmark runner
-│       │   └── evaluate_edge_cases_and_compare.py # Head-to-head edge-case evaluation
-│       ├── models/
-│       │   └── ensemble_matching_model/ # Pretrained Tri-Model Ensemble weights
-│       │       ├── ensemble_matching_model_xgb.json
-│       │       ├── ensemble_matching_model_lgb.txt
-│       │       ├── ensemble_matching_model_cat.cbm
-│       │       └── ensemble_matching_model_metadata.json
-│       ├── README.md                    # Reproduction & architecture guide
-│       └── requirements.txt             # Pinned dependency environment
-├── Documentation_template.md            # Methodology & architecture documentation
-├── DataResolvers_submission.zip         # Official final submission archive
-└── submission_package.zip               # Standalone submission archive mirror
-```
-
----
-
-## 9. Step-by-Step Reproduction Guide
-
-### Prerequisites
-- Python 3.10+ (tested on Python 3.10, 3.11, 3.12, and 3.14 on Windows & Linux).
-- At least 8 GB of RAM (pipeline operates within 4–6 GB peak RAM).
-
-### 1. Install Dependencies
 ```bash
-pip install -r code/business_entity_resolution/requirements.txt
+git clone https://github.com/jagadishpavanch/Amazon-ML-Challenge-2026-Business-Entity-Resolution.git
+cd Amazon-ML-Challenge-2026-Business-Entity-Resolution
+python3.10 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-### 2. Run Head-to-Head Edge-Case Benchmark (V1 vs V2)
-To reproduce the stratified comparison across all 5 edge-case categories on held-out validation data:
-```bash
-python code/business_entity_resolution/src/evaluate_edge_cases_and_compare.py 1000 15000
-```
+Pinned packages: see `requirements.txt`.
+- **Core:** pandas 2.3, numpy 2.2, scikit-learn 1.7, LightGBM 4.7, rapidfuzz, unidecode, jellyfish,
+  torch 2.13, transformers 4.44, sentence-transformers 3.0.
+- **Other CUDA versions:** if your NVIDIA driver is older than CUDA 13, install the matching torch
+  build, for example:
 
-### 3. Train Tri-Model Ensemble from Scratch (Optional)
-```bash
-python code/business_entity_resolution/src/pipeline.py --mode train --model ensemble --n-train 20000 --n-val 4000 --n-folds 5
-```
+  ```bash
+  pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu129
+  ```
 
-### 4. Execute Full Test Set Inference
-To regenerate `matching_results.tsv` and `candidate_pairs.tsv` across all 1.73M test records:
-```bash
-python code/business_entity_resolution/src/run_test_inference_fast.py
-```
+**Pretrained weights.** These are the only downloads. Put them in `../models/` next to the
+repository, or point `ER_MODELS_DIR` at another directory:
 
-### 5. Validate Output Files
-Run the competition validator to verify formatting:
 ```bash
-python student_resource/utils/validate_submission.py \
-    --matching output/matching_results.tsv \
-    --candidate output/candidate_pairs.tsv \
-    --test-dir dataset/test
+huggingface-cli download sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 \
+    --local-dir ../models/paraphrase-multilingual-MiniLM-L12-v2
+huggingface-cli download FacebookAI/xlm-roberta-base  --local-dir ../models/xlm-roberta-base
+huggingface-cli download FacebookAI/xlm-roberta-large --local-dir ../models/xlm-roberta-large
 ```
 
 ---
 
-## 10. Submission Package Specification
+## Data
 
-The official submission archive (`DataResolvers_submission.zip`) conforms strictly to the challenge format:
+The competition data is **not included**; it belongs to the organisers. Place it at the repository
+root like this:
 
-```text
-DataResolvers_submission.zip
-├── output/
-│   ├── matching_results.tsv        # Scored on public/private leaderboard
-│   └── candidate_pairs.tsv         # Evaluated for candidate generation efficiency
-├── code/
-│   └── business_entity_resolution/
-│       ├── src/                    # All runnable source files
-│       ├── README.md               # Reproduction documentation
-│       └── requirements.txt        # Pinned dependencies
-└── Documentation_template.md       # Detailed methodology write-up
 ```
+dataset/train/train_source1.tsv  train_source2.tsv  train_source3.tsv  train_ground_truth.tsv
+dataset/test/test_source1.tsv    test_source2.tsv   test_source3.tsv
+utils/validate_submission.py     # the organisers' validator (optional, used by reproduce.sh)
+```
+
+- **Source files:** `entity_id  business_name  business_address  country` (tab-separated; IDs
+  start with `S1-`, `S2-`, `S3-`).
+- **Ground truth:** `source1_entity_id  matched_entity_ids` (comma-separated, empty for businesses
+  with no duplicates).
+
+---
+
+## Usage
+
+All commands run from the repository root.
+
+### Reproduce the final submission
+
+```bash
+bash code/business_entity_resolution/reproduce.sh
+```
+
+This writes `output/matching_results.tsv` and `output/candidate_pairs.tsv`, then runs the validator.
+It chains every step below, and each step caches its results in `cache_repro/` so it can resume.
+
+| Step | Script | What it does |
+|---|---|---|
+| 1 | `run_pipeline.py --stage train` | round 1: blocking with score-chosen siblings, stage-1, MiniLM cross-encoder, stage-2 |
+| 2 | `train_biencoder.py` | fine-tune the retrieval bi-encoder (pass `f`) |
+| 3 | `run_pipeline.py` | round 2: siblings chosen by the round-1 model, pass `f`, pool twins; train + test |
+| 4 | `train_cross_encoder.py` + `ce_score_pairs.py` | XLM-R base cross-encoder |
+| 5 | `ce_adapt.py hard_neg` + `ce_score_pairs.py` | extra epoch on hard training pairs |
+| 6 | `train_cross_encoder.py` + `ce_score_pairs.py` | XLM-R large cross-encoder |
+| 7 | `stage2_refit.py` ×3 + `blend_refits.py` | three stage-2 variants, averaged, threshold 0.8 → `output/` |
+
+### Quick single-round run (smaller system, ≈0.982 CV)
+
+```bash
+python code/business_entity_resolution/src/run_pipeline.py \
+    --train-dir dataset/train --test-dir dataset/test --out-dir output
+```
+
+### Output format
+
+Both output files are tab-separated, with one row per test S1 entity. IDs are comma-separated and
+unquoted.
+
+```
+source1_entity_id   matched_entity_ids          # matching_results.tsv
+S1-000123           S2-004567,S3-008910
+S1-000124                                       # no match
+
+source1_entity_id   candidate_entity_ids        # candidate_pairs.tsv: every pair the model scored
+```
+
+Every matched ID is also listed in `candidate_pairs.tsv`.
+
+### Validate
+
+```bash
+python3 utils/validate_submission.py --matching output/matching_results.tsv \
+    --candidate output/candidate_pairs.tsv --test-dir dataset/test
+```
+
+---
+
+## Command-line reference
+
+| Script | Arguments | Output |
+|---|---|---|
+| `run_pipeline.py` | `--train-dir DIR --test-dir DIR --out-dir DIR [--stage all\|train\|test] [--no-cache] [--train-sample N] [--skip-lco]` | outputs in `--out-dir`; caches in `ER_CACHE_DIR` (candidate tables, `model.pkl`, `stage2_{train,test}.parquet`) |
+| `train_biencoder.py` | `BACKBONE_DIR OUT_DIR` | fine-tuned bi-encoder (skips if `OUT_DIR` exists) |
+| `train_cross_encoder.py` | `OUT_DIR BACKBONE_DIR LR` | cross-encoder trained on the cached train candidates (skips if it exists) |
+| `ce_adapt.py` | `hard_neg START_MODEL_DIR TAG` | one more epoch on hard pairs → `ER_CACHE_DIR/cross_encoder_TAG` |
+| `ce_score_pairs.py` | `TABLE.parquet SPLIT DATA_DIR MODEL_DIR OUT.npy` | per-row logit, aligned with the table. `CE_SHARD=i/n` splits the work across GPUs |
+| `stage2_refit.py` | `--tag T [--train-dir DIR] [--test-dir DIR] [--extra NAME=train.npy:test.npy]... [--drop COL]... [--seeds N] [--force-thr X] [--weight none\|s1\|s1sqrt] [--save-oof] [--heldout] [--out-dir DIR]` | `output_T/`, `model_T.pkl`, `reports/refit_T.json` |
+| `blend_refits.py` | `--tags T1,T2,... --thr X [--alpha A] --out-dir DIR --extra ...` | averaged decision from several saved refits |
+| `rethreshold.py` | `--tag T --thr X --out-dir DIR --extra ...` | the same refit with a different threshold |
+
+Main library entry points, for use from Python:
+
+```python
+from normalize import normalize_df               # normalised name/address fields for a DataFrame
+from metrics import f05, macro_f05               # per-entity and macro F0.5
+from decide import one_owner, select_threshold   # decision layer on a (s1, p, prob) table
+import cross_encoder as CE
+tok, model = CE.load_model("path/to/cross_encoder")
+logits = CE.score(raw_s1, raw_pool, s1_idx, pool_idx, tok, model)
+```
+
+---
+
+## Configuration
+
+Everything has a sensible default in `config.py`. Environment variables override it:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ER_CACHE_DIR` | `cache/` | where intermediate artefacts are cached |
+| `ER_MODELS_DIR` | `../models` | pretrained weights directory |
+| `ER_TRAIN_SAMPLE` | `600000` | training entities used for stage-1 / stage-2 |
+| `ER_SIB_PRIOR` | `ER_CACHE_DIR/prior_model.pkl` | round-1 model used to choose siblings |
+| `ER_BIENC` | *(empty = off)* | bi-encoder directory; enables blocking pass `f` |
+| `ER_CE_MODEL` | `ER_CACHE_DIR/cross_encoder_minilm` | MiniLM cross-encoder used inside `run_pipeline.py` |
+| `ER_TWINS` | `1` | pool-twin features on/off |
+| `ER_WORKERS` | cores − 2 | worker processes per pool (use ~32 on very large shared machines) |
+| `ER_LGB_THREADS` | cores − 2 | LightGBM threads |
+| `ER_LGB_LEAVES`, `ER_LGB_MCS`, `ER_LGB_L2` | 63, 20, 0 | LightGBM `num_leaves`, `min_child_samples`, `lambda_l2` |
+| `ER_EMB_MODEL` | `ER_MODELS_DIR/paraphrase-multilingual-MiniLM-L12-v2` | sentence-embedding backbone |
+| `ER_XLMR`, `ER_XLMR_LARGE` | `ER_MODELS_DIR/xlm-roberta-{base,large}` | cross-encoder backbones (`reproduce.sh`) |
+| `ER_TRAIN_DIR` | `dataset/train` | training data for `train_biencoder.py` / `train_cross_encoder.py` |
+| `ER_V7_DIR` | `ER_CACHE_DIR/../cache_v7` | cache holding the stage-1 tables read by `ce_adapt.py` |
+| `CE_LR` | `5e-5` | cross-encoder learning rate |
+| `CE_SHARD` | `0/1` | `i/n`: score shard *i* of *n* in `ce_score_pairs.py` (one GPU per shard) |
+| `PY`, `ER_CACHE_ROOT` | `python`, `cache_repro` | interpreter and cache root used by `reproduce.sh` |
+
+Blocking K per pass is read from `ER_CACHE_DIR/blocking_k.json`, for example
+`{"K": {"w": 10, "e1": 3, "e2": 0, "c": 3, "a": 5, "s": 3, "f": 5}}`.
+
+---
+
+## Hardware and runtime
+
+The full `reproduce.sh` takes about 20 h on one data-centre GPU with 32+ cores and 64+ GB RAM. The
+two blocking rounds take most of that, and cross-encoder training and scoring about 6 h.
+
+Tested on:
+- 32 cores / 62 GB / RTX PRO 4000;
+- 64 cores / 251 GB / 2× RTX A6000;
+- 192 cores / 1 TB / H200.
+
+The single-round pipeline needs about 8 h.
+
+---
+
+## Models and licences
+
+| Model | Licence | Parameters | Role |
+|---|---|---|---|
+| [paraphrase-multilingual-MiniLM-L12-v2](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2) | Apache-2.0 | 118M | blocking embeddings; bi-encoder and cross-encoder backbone |
+| [xlm-roberta-base](https://huggingface.co/FacebookAI/xlm-roberta-base) | MIT | 278M | cross-encoders 2 and 3 |
+| [xlm-roberta-large](https://huggingface.co/FacebookAI/xlm-roberta-large) | MIT | 560M | cross-encoder 4 |
+| [LightGBM](https://github.com/microsoft/LightGBM) | MIT | – | stage-1 and stage-2 classifiers |
+
+**No external data, APIs, or geocoding are used.**
+- TF-IDF and IDF statistics are fitted on the unlabelled text of each split.
+- Every model is trained on the training labels only; no test labels or pseudo-labels.
+
+---
+
+## Team
+
+**Team Shield**, ML Challenge 2026:
+
+- Jagadish Pavan Chegondi
+- BODDU SURYA TEJA
+- Leela Sai Vardhan Dhavala
+
+---
+
+## License
+
+This code is released under the [MIT License](LICENSE). The competition dataset is not part of this
+repository and is subject to the organisers' terms.

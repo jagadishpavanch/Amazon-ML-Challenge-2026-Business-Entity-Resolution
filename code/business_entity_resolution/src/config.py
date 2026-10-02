@@ -1,144 +1,75 @@
-"""
-Central Configuration for Amazon ML Challenge 2026 - Business Entity Resolution Pipeline
-All parameters, file paths, blocking rules, feature toggles, and model hyperparameters live here.
-"""
-
+"""Central configuration: paths, seeds, blocking K, model names."""
 import os
-from dataclasses import dataclass, field
-from typing import Dict, List, Set
+import random
 
-@dataclass
-class PipelineConfig:
-    # -------------------------------------------------------------------------
-    # Directory & File Paths (strictly tab-separated TSV)
-    # -------------------------------------------------------------------------
-    project_root: str = field(default_factory=lambda: os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-    data_dir: str = "dataset"
-    train_dir: str = "dataset/train"
-    test_dir: str = "dataset/test"
-    output_dir: str = "output"
-    model_dir: str = "models"
-    
-    # Filenames
-    train_s1_file: str = "train_source1.tsv"
-    train_s2_file: str = "train_source2.tsv"
-    train_s3_file: str = "train_source3.tsv"
-    train_gt_file: str = "train_ground_truth.tsv"
-    
-    test_s1_file: str = "test_source1.tsv"
-    test_s2_file: str = "test_source2.tsv"
-    test_s3_file: str = "test_source3.tsv"
-    
-    output_matching_file: str = "matching_results.tsv"
-    output_candidate_file: str = "candidate_pairs.tsv"
-    
-    # -------------------------------------------------------------------------
-    # Normalization Settings
-    # -------------------------------------------------------------------------
-    # Bidirectional legal suffix mapping table (English, French, Hindi)
-    legal_suffix_map: Dict[str, str] = field(default_factory=lambda: {
-        # English / General
-        "corp": "corporation", "corporation": "corporation",
-        "inc": "incorporated", "incorporated": "incorporated",
-        "ltd": "limited", "limited": "limited",
-        "pvt": "private", "private": "private",
-        "co": "company", "company": "company",
-        "llc": "llc", "l.l.c.": "llc",
-        "llp": "llp", "l.l.p.": "llp",
-        "pllc": "pllc", "p.l.l.c.": "pllc",
-        "pc": "pc", "p.c.": "pc",
-        "plc": "plc", "p.l.c.": "plc",
-        # French (for France test entities)
-        "sarl": "sarl", "s.a.r.l.": "sarl",
-        "sas": "sas", "s.a.s.": "sas",
-        "sasu": "sasu", "s.a.s.u.": "sasu",
-        "sa": "sa", "s.a.": "sa",
-        "sci": "sci", "s.c.i.": "sci",
-        "eurl": "eurl", "e.u.r.l.": "eurl",
-        "snc": "snc", "s.n.c.": "snc",
-        "ste": "societe", "societe": "societe", "société": "societe",
-        # Indian Languages (Hindi / Devanagari & Transliterated Latin)
-        "प्राइवेट लिमिटेड": "private limited",
-        "प्रा. लि.": "private limited",
-        "प्रा लि": "private limited",
-        "लिमिटेड": "limited",
-        "लि.": "limited",
-        "एलएलपी": "llp",
-        "कंपनी": "company",
-        "कम्पनी": "company",
-        "praivet limited": "private limited",
-        "praivet": "private",
-        "elelpi": "llp",
-        "limitted": "limited",
-        "kampani": "company",
-        "kompani": "company",
-    })
-    
-    landmark_keywords: List[str] = field(default_factory=lambda: [
-        "near", "opp", "opposite", "behind", "b/h", "beside",
-        "adjacent", "next to", "in front of", "close to"
-    ])
-    
-    name_stopwords: Set[str] = field(default_factory=lambda: {
-        "inc", "incorporated", "corp", "corporation", "ltd", "limited",
-        "pvt", "private", "co", "company", "llc", "llp", "the", "and", "of",
-        "services", "solutions", "enterprises", "group", "holdings", "management"
-    })
-    
-    addr_stopwords: Set[str] = field(default_factory=lambda: {
-        "road", "rd", "street", "st", "lane", "ln", "avenue", "ave", "floor",
-        "near", "opp", "opposite", "behind", "flat", "plot", "no", "co", "c", "o",
-        "dr", "drive", "way", "blvd", "boulevard", "h", "house", "shop", "block",
-        "bldg", "building", "apt", "apartment", "unit", "suite", "north", "south",
-        "east", "west", "new", "city"
-    })
+import numpy as np
 
-    # -------------------------------------------------------------------------
-    # Blocking Hyperparameters (Bounded for high precision & memory safety)
-    # -------------------------------------------------------------------------
-    max_candidates_per_entity: int = 20
-    max_block_token_frequency: int = 150
-    min_token_len: int = 3
+SEED = 42
+
+SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+PKG_DIR = os.path.dirname(SRC_DIR)                      # code/business_entity_resolution
+ROOT_DIR = os.path.dirname(os.path.dirname(PKG_DIR))    # student_resource
+CACHE_DIR = os.environ.get("ER_CACHE_DIR", os.path.join(ROOT_DIR, "cache"))
+REPORTS_DIR = os.path.join(ROOT_DIR, "reports")
+MODELS_DIR = os.environ.get("ER_MODELS_DIR", os.path.join(os.path.dirname(ROOT_DIR), "models"))
+
+# Pretrained encoders (both multilingual, both permissive licenses).
+EMB_MODEL = os.environ.get(
+    "ER_EMB_MODEL", os.path.join(MODELS_DIR, "paraphrase-multilingual-MiniLM-L12-v2"))
+EMB_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 (Apache-2.0)"
+EMB_BATCH = 1024
+
+# Blocking: top-K per source (S2, S3) for each nearest-neighbour pass (tuned by tune_blocking.py).
+K_PASSES = {"w": 10, "e1": 3, "e2": 0, "c": 3, "a": 5}
+# Sibling-based blocking (pass "s"): siblings = top SIB_TOP candidates per S1 with combo >= SIB_MIN.
+SIB_MIN = 0.75
+SIB_TOP = 3
+# If a previous run's model is available, siblings are chosen by its stage-1 probability instead of the
+# cheap combo score (probe: recall 0.9813 vs 0.9743). Set ER_SIB_PRIOR to that run's model.pkl.
+SIB_PRIOR_MODEL = os.environ.get("ER_SIB_PRIOR", os.path.join(CACHE_DIR, "prior_model.pkl"))
+SIB_MIN_MODEL = 0.5
+SIB_TOP_MODEL = 5
+_KFILE = os.path.join(CACHE_DIR, "blocking_k.json")
+if os.path.exists(_KFILE):
+    import json as _json
+    with open(_KFILE) as _f:
+        K_PASSES = _json.load(_f)["K"]
+B5_CAP = 30
+
+# Number of train S1 entities (with all their candidates) used for CV / model fitting.
+TRAIN_S1_SAMPLE = int(os.environ.get("ER_TRAIN_SAMPLE", 600_000))
+
+# Stage-2 stacking on neighbour stage-1 probabilities (see stage2.py).
+USE_STAGE2 = True
+# Stage-2 extras: sibling (cluster-support) features and the fine-tuned cross-encoder score.
+USE_SIBLINGS = True
+USE_TWINS = os.environ.get("ER_TWINS", "1") == "1"   # per-pool-record nearest-twin similarity (distractor detection)
+USE_CE = True
+CE_P1_MIN = 0.01            # only pairs with stage-1 prob >= this are scored by the cross-encoder
+# fine-tuned bi-encoder for retrieval pass "f" (train_biencoder.py); empty -> pass disabled
+BIENC_DIR = os.environ.get("ER_BIENC", "")
+CE_MODEL_DIR = os.environ.get("ER_CE_MODEL", os.path.join(CACHE_DIR, "cross_encoder_minilm"))
+# Second cross-encoder (XLM-R base, MIT), added to stage-2 by stage2_refit.py (see reproduce.sh)
+XLMR_BACKBONE = os.environ.get("ER_XLMR", os.path.join(MODELS_DIR, "xlm-roberta-base"))
+XLMR_DIR = os.path.join(CACHE_DIR, "cross_encoder_xlmr")
+
+N_FOLDS = 5
+LGB_PARAMS = dict(
+    objective="binary", num_leaves=int(os.environ.get("ER_LGB_LEAVES", 63)), learning_rate=0.05, feature_fraction=0.8,
+    bagging_fraction=0.8, bagging_freq=1, min_child_samples=int(os.environ.get("ER_LGB_MCS", 20)), seed=SEED,
+    lambda_l2=float(os.environ.get("ER_LGB_L2", 0.0)),
+    verbose=-1, num_threads=int(os.environ.get("ER_LGB_THREADS", max(1, (os.cpu_count() or 4) - 2))),
+)
+LGB_MAX_ROUNDS = 2000
+LGB_EARLY_STOP = 100
 
 
-    # -------------------------------------------------------------------------
-    # Model Hyperparameters (Tri-Model Ensemble: XGBoost + LightGBM + CatBoost)
-    # -------------------------------------------------------------------------
-    architecture: str = "ensemble"  # "ensemble", "xgboost", "lightgbm", "catboost"
-    sample_train_entities: int = 20000
-    sample_val_entities: int = 4000
-    n_cv_folds: int = 5  # 5-fold GroupKFold cross-validation
-    imbalance_strategy: str = "sqrt_ratio"  # "sqrt_ratio", "full_ratio", "none"
-    
-    n_estimators: int = 100
-    max_depth: int = 5
-    learning_rate: float = 0.08
-    subsample: float = 0.85
-    colsample_bytree: float = 0.80
-    random_state: int = 42
-    n_jobs: int = -1
-    tree_method: str = "hist"
-    device: str = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") or os.path.exists("/kaggle") else "cpu"
-    
-    ensemble_weights: Dict[str, float] = field(default_factory=lambda: {
-        "xgboost": 0.40,
-        "lightgbm": 0.35,
-        "catboost": 0.25
-    })
-    use_fold_averaging: bool = False
-    experiments_dir: str = "experiments"
-
-    # -------------------------------------------------------------------------
-    # Decision Threshold & Global Consistency Post-Processing
-    # -------------------------------------------------------------------------
-    decision_threshold: float = 0.850
-    use_global_consistency: bool = True
-    
-    # -------------------------------------------------------------------------
-    # Hardware & Batching
-    # -------------------------------------------------------------------------
-    batch_size: int = 25000
-    verbose: bool = True
-
-CONFIG = PipelineConfig()
-
+def seed_everything(seed: int = SEED) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    try:
+        import torch
+        torch.manual_seed(seed)
+    except ImportError:
+        pass
